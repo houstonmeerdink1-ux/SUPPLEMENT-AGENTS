@@ -158,6 +158,35 @@ class IdentityResolverTests(unittest.TestCase):
         self.assertEqual("66103", job["zip"])
         self.assertEqual("12345 Main Street, Sample City, KS 66103", job["exact_address"])
 
+    def test_common_street_direction_and_suffix_abbreviations_are_equivalent(self):
+        roster_path = self.mirror / "_MIRROR CONTROL" / "approved-jobs.csv"
+        rows = list(csv.DictReader(roster_path.read_text(encoding="utf-8").splitlines()))
+        for row in rows:
+            if row["job_number"] == "9003":
+                row["exact_address"] = "11157 S Barth Rd, Sample City, KS 66103"
+        with roster_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
+            writer.writeheader()
+            writer.writerows(rows)
+
+        job_path = (
+            self.mirror
+            / "Beta Homeowner - 300 Main Street"
+            / "01 JOBNIMBUS SOURCE"
+            / "Record"
+            / "jobnimbus-job.json"
+        )
+        contact_path = job_path.with_name("jobnimbus-contact.json")
+        for path in (job_path, contact_path):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["address_line1"] = "11157 South Barth Road"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+        index = self.core.build_index(self.mirror)
+        job = self.core.resolve_job(index, "Beta Homeowner")
+
+        self.assertEqual("11157 South Barth Road, Sample City, KS 66103", job["exact_address"])
+
 
 if __name__ == "__main__":
     unittest.main()

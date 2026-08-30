@@ -21,6 +21,32 @@ JOB_CONTROL = "00 MIRROR CONTROL"
 JOB_SOURCE = "01 JOBNIMBUS SOURCE"
 JOB_WORKING = "02 LOCAL WORKING FILES"
 
+_STREET_DIRECTIONS = {
+    "n": "north",
+    "s": "south",
+    "e": "east",
+    "w": "west",
+    "ne": "northeast",
+    "nw": "northwest",
+    "se": "southeast",
+    "sw": "southwest",
+}
+
+_STREET_SUFFIXES = {
+    "ave": "avenue",
+    "blvd": "boulevard",
+    "cir": "circle",
+    "ct": "court",
+    "dr": "drive",
+    "hwy": "highway",
+    "ln": "lane",
+    "pkwy": "parkway",
+    "pl": "place",
+    "rd": "road",
+    "st": "street",
+    "ter": "terrace",
+}
+
 
 class FastLaneError(RuntimeError):
     """Base error for deterministic fast-lane operations."""
@@ -138,7 +164,11 @@ def normalize_name(value: str) -> str:
 
 def _normalize_street(value: str) -> str:
     first_segment = (value or "").split(",", 1)[0]
-    return normalize_name(first_segment)
+    tokens = normalize_name(first_segment).split()
+    tokens = [_STREET_DIRECTIONS.get(token, token) for token in tokens]
+    if tokens:
+        tokens[-1] = _STREET_SUFFIXES.get(tokens[-1], tokens[-1])
+    return " ".join(tokens)
 
 
 def _five_digit_zip(value: Any) -> str:
