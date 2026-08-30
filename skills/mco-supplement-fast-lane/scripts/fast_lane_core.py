@@ -51,6 +51,26 @@ class AmbiguousIdentityError(FastLaneError):
         super().__init__(f"Ambiguous job name {query!r}: {rendered}")
 
 
+class StateTransitionError(FastLaneError):
+    """Raised when a caller attempts to skip a required fast-lane phase."""
+
+
+TRANSITIONS = {
+    "NAME_RECEIVED": {"IDENTITY_LOCKED", "AMBIGUOUS_IDENTITY"},
+    "IDENTITY_LOCKED": {"LOCAL_READY", "SOURCE_INCOMPLETE"},
+    "LOCAL_READY": {"DELTA_CHECKED", "SOURCE_CHANGED"},
+    "DELTA_CHECKED": {"SCOPE_AUDITED", "SOURCE_CHANGED"},
+    "SCOPE_AUDITED": {"SCOPE_APPROVED", "ACTION_NEEDED_FROM_HOUSTON"},
+    "SCOPE_APPROVED": {"PRICING_READY"},
+    "PRICING_READY": {"XACTIMATE_EXPORTED", "XACTIMATE_BLOCKED"},
+    "XACTIMATE_EXPORTED": {"VERIFIED"},
+    "SOURCE_INCOMPLETE": {"LOCAL_READY"},
+    "SOURCE_CHANGED": {"LOCAL_READY"},
+    "ACTION_NEEDED_FROM_HOUSTON": {"SCOPE_AUDITED"},
+    "XACTIMATE_BLOCKED": {"PRICING_READY"},
+}
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -65,6 +85,24 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise IdentityConflictError(f"Required source record is not a JSON object: {path}")
     return value
+
+
+def _read_optional_json(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _atomic_json_write(path: Path, value: Any) -> Path:
@@ -295,3 +333,149 @@ def write_index(index: dict[str, Any], mirror_root: Path) -> Path:
     }
     _atomic_json_write(control / "fast-job-index-state.json", state)
     return output
+
+
+def fingerprint_job(job: dict[str, Any]) -> dict[str, Any]:
+    input_paths = {
+        "job_source": Path(str(job["job_source_path"])),
+        "contact_source": Path(str(job["contact_source_path"])),
+        "source_manifest": Path(str(job["source_manifest_path"])),
+        "verification": Path(str(job["verification_path"])),
+    }
+    inputs: dict[str, dict[str, Any]] = {}
+    combined = hashlib.sha256()
+    combined.update(f"mco-supplement-fast-lane:{SCHEMA_VERSION}\n".encode("utf-8"))
+    for label in sorted(input_paths):
+        path = input_paths[label]
+        if not path.is_file():
+            raise IdentityConflictError(f"Fingerprint input is missing: {path}")
+        digest = _sha256_file(path)
+        size = path.stat().st_size
+        inputs[label] = {
+            "path": str(path.resolve()),
+            "byte_size": size,
+            "sha256": digest,
+        }
+        combined.update(f"{label}\0{digest}\0{size}\n".encode("utf-8"))
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "job_id": job["job_id"],
+        "inputs": inputs,
+        "source_fingerprint": combined.hexdigest(),
+    }
+
+
+def transition_state(
+    run_state: dict[str, Any],
+    target: str,
+    *,
+    reason: str,
+    now: str | None = None,
+) -> dict[str, Any]:
+    current = str(run_state.get("state") or "")
+    if target not in TRANSITIONS.get(current, set()):
+        raise StateTransitionError(f"Fast-lane state cannot move from {current!r} to {target!r}")
+    moved = json.loads(json.dumps(run_state))
+    moved.setdefault("history", []).append(
+        {
+            "from": current,
+            "to": target,
+            "reason": reason,
+            "at": now or _utc_now(),
+        }
+    )
+    moved["state"] = target
+    moved["updated_at"] = now or _utc_now()
+    return moved
+
+
+def _job_context(job: dict[str, Any], prepared_at: str) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "prepared_at": prepared_at,
+        "job_name": job["job_name"],
+        "job_number": job["job_number"],
+        "job_id": job["job_id"],
+        "contact_id": job["contact_id"],
+        "exact_address": job["exact_address"],
+        "zip": job["zip"],
+        "address_authority": job["address_authority"],
+        "pricing_identity_ready": job["pricing_identity_ready"],
+        "folder_path": job["folder_path"],
+        "verification_state": job["verification_state"],
+        "fully_verified": job["fully_verified"],
+        "captured_remote_metadata": job["captured_remote_metadata"],
+        "authority": {
+            "identity": "JobNimbus source JSON plus mirror control",
+            "source": "01 JOBNIMBUS SOURCE",
+            "generated_work": "02 LOCAL WORKING FILES/00 FAST LANE",
+        },
+    }
+
+
+def prepare_job(
+    job: dict[str, Any],
+    *,
+    now: str | None = None,
+) -> dict[str, Any]:
+    prepared_at = now or _utc_now()
+    working = Path(str(job["folder_path"])) / JOB_WORKING / "00 FAST LANE"
+    fingerprint_path = working / "source-fingerprint.json"
+    run_state_path = working / "run-state.json"
+    existing_fingerprint = _read_optional_json(fingerprint_path)
+    existing_state = _read_optional_json(run_state_path)
+    current_fingerprint = fingerprint_job(job)
+    cache_hit = bool(
+        existing_fingerprint
+        and existing_fingerprint.get("source_fingerprint")
+        == current_fingerprint["source_fingerprint"]
+    )
+
+    stale_candidates = (
+        "evidence-index.json",
+        "carrier-scope.json",
+        "scope-gap.json",
+        "xactimate-entry-manifest.json",
+    )
+    stale_artifacts = [name for name in stale_candidates if (working / name).exists()]
+    blockers: list[str] = []
+    if not job.get("fully_verified"):
+        state = "SOURCE_INCOMPLETE"
+        blockers.append("mirror verification is incomplete")
+    elif existing_fingerprint and not cache_hit:
+        state = "SOURCE_CHANGED"
+        blockers.append("authoritative local source fingerprint changed")
+    elif cache_hit and existing_state and existing_state.get("state"):
+        state = str(existing_state["state"])
+        blockers = list(existing_state.get("blockers") or [])
+        stale_artifacts = list(existing_state.get("stale_artifacts") or [])
+    else:
+        state = "LOCAL_READY"
+
+    history = list((existing_state or {}).get("history") or [])
+    previous_state = (existing_state or {}).get("state")
+    if previous_state and previous_state != state:
+        history.append(
+            {
+                "from": previous_state,
+                "to": state,
+                "reason": "prepare recalculated source and verification state",
+                "at": prepared_at,
+            }
+        )
+    run_state = {
+        "schema_version": SCHEMA_VERSION,
+        "job_id": job["job_id"],
+        "source_fingerprint": current_fingerprint["source_fingerprint"],
+        "state": state,
+        "cache_hit": cache_hit,
+        "blockers": blockers,
+        "stale_artifacts": stale_artifacts if state == "SOURCE_CHANGED" else [],
+        "updated_at": prepared_at,
+        "history": history,
+    }
+
+    _atomic_json_write(working / "job-context.json", _job_context(job, prepared_at))
+    _atomic_json_write(fingerprint_path, current_fingerprint)
+    _atomic_json_write(run_state_path, run_state)
+    return run_state
