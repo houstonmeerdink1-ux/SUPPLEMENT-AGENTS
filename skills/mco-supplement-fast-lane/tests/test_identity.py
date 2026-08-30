@@ -128,6 +128,36 @@ class IdentityResolverTests(unittest.TestCase):
         self.assertFalse(job["pricing_identity_ready"])
         self.assertEqual("", job["zip"])
 
+    def test_five_digit_street_number_is_not_mistaken_for_roster_zip(self):
+        roster_path = self.mirror / "_MIRROR CONTROL" / "approved-jobs.csv"
+        rows = list(csv.DictReader(roster_path.read_text(encoding="utf-8").splitlines()))
+        for row in rows:
+            if row["job_number"] == "9003":
+                row["exact_address"] = "12345 Main Street, Sample City, KS 66103"
+        with roster_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
+            writer.writeheader()
+            writer.writerows(rows)
+
+        job_path = (
+            self.mirror
+            / "Beta Homeowner - 300 Main Street"
+            / "01 JOBNIMBUS SOURCE"
+            / "Record"
+            / "jobnimbus-job.json"
+        )
+        contact_path = job_path.with_name("jobnimbus-contact.json")
+        for path in (job_path, contact_path):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["address_line1"] = "12345 Main Street"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+        index = self.core.build_index(self.mirror)
+        job = self.core.resolve_job(index, "Beta Homeowner")
+
+        self.assertEqual("66103", job["zip"])
+        self.assertEqual("12345 Main Street, Sample City, KS 66103", job["exact_address"])
+
 
 if __name__ == "__main__":
     unittest.main()

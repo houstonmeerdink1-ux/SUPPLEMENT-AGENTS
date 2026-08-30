@@ -142,8 +142,8 @@ def _normalize_street(value: str) -> str:
 
 
 def _five_digit_zip(value: Any) -> str:
-    match = re.search(r"\b(\d{5})\b", str(value or ""))
-    return match.group(1) if match else ""
+    matches = re.findall(r"\b(\d{5})\b", str(value or ""))
+    return matches[-1] if matches else ""
 
 
 def _source_address(record: dict[str, Any]) -> tuple[str, str]:
