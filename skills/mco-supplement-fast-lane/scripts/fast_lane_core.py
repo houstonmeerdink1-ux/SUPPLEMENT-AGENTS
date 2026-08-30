@@ -799,3 +799,48 @@ def persist_pricing_manifest(
     }
     _atomic_json_write(state_path, pricing_state)
     return pricing_state
+
+
+def read_run_state(job: dict[str, Any]) -> dict[str, Any]:
+    working = Path(str(job["folder_path"])) / JOB_WORKING / "00 FAST LANE"
+    state = _read_optional_json(working / "run-state.json")
+    if state:
+        return state
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "job_id": job["job_id"],
+        "state": "NOT_PREPARED",
+        "blockers": [],
+        "history": [],
+    }
+
+
+def record_scope_audit(
+    job: dict[str, Any],
+    scope_gap: dict[str, Any],
+    *,
+    now: str | None = None,
+) -> dict[str, Any]:
+    validate_scope_gap(scope_gap, job)
+    audited_at = now or _utc_now()
+    working = Path(str(job["folder_path"])) / JOB_WORKING / "00 FAST LANE"
+    run_state = read_run_state(job)
+    if run_state.get("state") != "DELTA_CHECKED":
+        raise StateTransitionError(
+            f"Scope audit requires DELTA_CHECKED state, found {run_state.get('state')!r}"
+        )
+    audited_state = transition_state(
+        run_state,
+        "SCOPE_AUDITED",
+        reason="source-backed unpriced scope gap validated",
+        now=audited_at,
+    )
+    scope_path = working / "scope-gap.json"
+    _atomic_json_write(scope_path, scope_gap)
+    audited_state["scope_gap"] = {
+        "path": str(scope_path.resolve()),
+        "sha256": _sha256_file(scope_path),
+        "approval_state": scope_gap.get("approval_state"),
+    }
+    _atomic_json_write(working / "run-state.json", audited_state)
+    return audited_state
