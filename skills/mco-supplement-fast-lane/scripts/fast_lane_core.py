@@ -55,6 +55,14 @@ class StateTransitionError(FastLaneError):
     """Raised when a caller attempts to skip a required fast-lane phase."""
 
 
+class ScopeValidationError(FastLaneError):
+    """Raised when a scope-gap document lacks required source-backed structure."""
+
+
+class ScopeApprovalError(FastLaneError):
+    """Raised when scope has not received explicit Houston approval."""
+
+
 TRANSITIONS = {
     "NAME_RECEIVED": {"IDENTITY_LOCKED", "AMBIGUOUS_IDENTITY"},
     "IDENTITY_LOCKED": {"LOCAL_READY", "SOURCE_INCOMPLETE"},
@@ -606,3 +614,188 @@ def record_live_delta(
     run_state["blockers"] = blockers
     _atomic_json_write(state_path, run_state)
     return run_state
+
+
+def _validate_price_list(value: dict[str, str], label: str) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ScopeValidationError(f"{label} price list must be an object")
+    code = str(value.get("code") or "").strip()
+    month = str(value.get("month") or "").strip()
+    if not code:
+        raise ScopeValidationError(f"{label} price list requires an exact code")
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month):
+        raise ScopeValidationError(f"{label} price list month must use YYYY-MM")
+    return {"code": code, "month": month}
+
+
+def validate_scope_gap(payload: dict[str, Any], job: dict[str, Any]) -> None:
+    if not isinstance(payload, dict):
+        raise ScopeValidationError("Scope gap must be a JSON object")
+    identity = payload.get("job_identity")
+    if not isinstance(identity, dict):
+        raise ScopeValidationError("Scope gap requires job_identity")
+    expected_identity = {
+        "job_id": str(job["job_id"]),
+        "job_number": str(job["job_number"]),
+        "exact_address": str(job["exact_address"]),
+        "zip": str(job["zip"]),
+    }
+    actual_identity = {key: str(identity.get(key) or "") for key in expected_identity}
+    if actual_identity != expected_identity:
+        raise IdentityConflictError(
+            f"Scope-gap identity does not match locked job: {actual_identity!r} != {expected_identity!r}"
+        )
+
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        raise ScopeValidationError("Scope gap requires at least one item")
+    seen: set[str] = set()
+    prohibited_price_fields = {"unit_price", "price", "replacement_cost", "rcv", "total"}
+    for item in items:
+        if not isinstance(item, dict):
+            raise ScopeValidationError("Every scope-gap item must be an object")
+        item_id = str(item.get("item_id") or "").strip()
+        if not item_id or item_id in seen:
+            raise ScopeValidationError("Every scope-gap item requires a unique item_id")
+        seen.add(item_id)
+        price_fields = prohibited_price_fields.intersection(item)
+        if price_fields:
+            raise ScopeValidationError(
+                f"Scope-gap item {item_id} may not supply Xactimate price fields: {sorted(price_fields)}"
+            )
+        if not str(item.get("status") or "").strip():
+            raise ScopeValidationError(f"Scope-gap item {item_id} requires status")
+        if not str(item.get("description") or "").strip():
+            raise ScopeValidationError(f"Scope-gap item {item_id} requires description")
+
+
+def approve_scope(
+    payload: dict[str, Any],
+    job: dict[str, Any],
+    *,
+    approved_by: str,
+    approved_at: str,
+    baseline: dict[str, str],
+    target: dict[str, str],
+) -> dict[str, Any]:
+    validate_scope_gap(payload, job)
+    if payload.get("approval_state") != "HOUSTON_APPROVED":
+        raise ScopeApprovalError("Scope gap must be explicitly marked HOUSTON_APPROVED")
+    approver = str(approved_by or "").strip()
+    if normalize_name(approver) != "houston":
+        raise ScopeApprovalError("Scope pricing approval must be attributed to Houston")
+    approved_ids = payload.get("approved_item_ids")
+    if (
+        not isinstance(approved_ids, list)
+        or not approved_ids
+        or len(set(map(str, approved_ids))) != len(approved_ids)
+    ):
+        raise ScopeApprovalError("approved_item_ids must be a non-empty unique list")
+    by_id = {str(item["item_id"]): item for item in payload["items"]}
+    requested_items: list[dict[str, Any]] = []
+    for raw_id in approved_ids:
+        item_id = str(raw_id)
+        item = by_id.get(item_id)
+        if item is None:
+            raise ScopeApprovalError(f"Approved scope item does not exist: {item_id}")
+        if item.get("status") != "REQUESTED":
+            raise ScopeApprovalError(
+                f"Only REQUESTED items may be priced; {item_id} is {item.get('status')!r}"
+            )
+        quantity = item.get("quantity")
+        if not isinstance(quantity, dict):
+            raise ScopeValidationError(f"Requested item {item_id} requires supported quantity")
+        value = quantity.get("value")
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+            raise ScopeValidationError(f"Requested item {item_id} quantity must be positive")
+        if not str(quantity.get("unit") or "").strip() or not str(quantity.get("source") or "").strip():
+            raise ScopeValidationError(
+                f"Requested item {item_id} quantity requires unit and source"
+            )
+        evidence = item.get("evidence")
+        if not isinstance(evidence, list) or not evidence:
+            raise ScopeValidationError(f"Requested item {item_id} requires evidence pointer(s)")
+        for pointer in evidence:
+            if (
+                not isinstance(pointer, dict)
+                or not str(pointer.get("source_id") or "").strip()
+                or not str(pointer.get("source_path") or "").strip()
+            ):
+                raise ScopeValidationError(
+                    f"Requested item {item_id} has an incomplete evidence pointer"
+                )
+        carrier_credit = item.get("carrier_credit")
+        if not isinstance(carrier_credit, dict) or not str(carrier_credit.get("status") or "").strip():
+            raise ScopeValidationError(f"Requested item {item_id} requires carrier_credit status")
+        unresolved = item.get("unresolved_questions")
+        if not isinstance(unresolved, list) or unresolved:
+            raise ScopeApprovalError(
+                f"Requested item {item_id} still has unresolved questions"
+            )
+        requested_items.append(json.loads(json.dumps(item)))
+
+    baseline_record = _validate_price_list(baseline, "Carrier baseline")
+    target_record = _validate_price_list(target, "Authorized target")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "state": "PRICING_READY",
+        "job_identity": {
+            "job_name": job["job_name"],
+            "job_number": job["job_number"],
+            "job_id": job["job_id"],
+            "contact_id": job["contact_id"],
+            "exact_address": job["exact_address"],
+            "zip": job["zip"],
+        },
+        "approved_by": approver,
+        "approved_at": approved_at,
+        "carrier_baseline_price_list": baseline_record,
+        "authorized_target_price_list": target_record,
+        "requested_items": requested_items,
+        "pricing_authority": "Xactimate; this manifest contains no unit prices",
+        "external_action_authorized": False,
+    }
+
+
+def persist_pricing_manifest(
+    job: dict[str, Any],
+    manifest: dict[str, Any],
+    *,
+    now: str | None = None,
+) -> dict[str, Any]:
+    working = Path(str(job["folder_path"])) / JOB_WORKING / "00 FAST LANE"
+    state_path = working / "run-state.json"
+    run_state = _read_optional_json(state_path)
+    if not run_state:
+        raise StateTransitionError("Prepare and audit the job before persisting pricing input")
+    if run_state.get("state") != "SCOPE_AUDITED":
+        raise StateTransitionError(
+            f"Pricing manifest requires SCOPE_AUDITED state, found {run_state.get('state')!r}"
+        )
+    identity = manifest.get("job_identity") if isinstance(manifest, dict) else None
+    if not isinstance(identity, dict) or str(identity.get("job_id") or "") != str(job["job_id"]):
+        raise IdentityConflictError("Pricing manifest identity does not match locked job")
+    if manifest.get("state") != "PRICING_READY":
+        raise ScopeApprovalError("Pricing manifest is not in PRICING_READY state")
+
+    approved_at = now or _utc_now()
+    approved_state = transition_state(
+        run_state,
+        "SCOPE_APPROVED",
+        reason="Houston-approved scope manifest validated",
+        now=approved_at,
+    )
+    pricing_state = transition_state(
+        approved_state,
+        "PRICING_READY",
+        reason="Approved unpriced scope is ready for Xactimate",
+        now=approved_at,
+    )
+    manifest_path = working / "xactimate-entry-manifest.json"
+    _atomic_json_write(manifest_path, manifest)
+    pricing_state["xactimate_entry_manifest"] = {
+        "path": str(manifest_path.resolve()),
+        "sha256": _sha256_file(manifest_path),
+    }
+    _atomic_json_write(state_path, pricing_state)
+    return pricing_state
