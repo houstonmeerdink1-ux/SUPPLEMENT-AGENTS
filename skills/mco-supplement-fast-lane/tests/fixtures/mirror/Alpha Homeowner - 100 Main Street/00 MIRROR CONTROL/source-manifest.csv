@@ -1,0 +1,3 @@
+source_category,source_system,source_id,source_name,relative_path,captured_at,byte_size,sha256,file_type,verification_state,notes
+record,Synthetic JobNimbus,job-alpha-100,Job 9001,"01 JOBNIMBUS SOURCE/Record/jobnimbus-job.json",2026-08-30T08:00:00-0500,300,1111111111111111111111111111111111111111111111111111111111111111,JSON,VERIFIED,synthetic fixture
+record,Synthetic JobNimbus,contact-alpha-100,Contact 9101,"01 JOBNIMBUS SOURCE/Record/jobnimbus-contact.json",2026-08-30T08:00:00-0500,200,2222222222222222222222222222222222222222222222222222222222222222,JSON,VERIFIED,synthetic fixture

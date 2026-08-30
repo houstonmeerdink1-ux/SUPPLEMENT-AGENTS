@@ -1,0 +1,5 @@
+decision,job_number,job_name,exact_address,status,archived,approval_date
+approved,9001,Alpha Homeowner,"100 Main Street, Sample City, KS 66101",Scope Received,false,2026-08-30
+approved,9002,Alpha Homeowner,"200 Main Street, Sample City, KS 66102",Scope Received,false,2026-08-30
+approved,9003,Beta Homeowner,"300 Main Street, Sample City, KS 66103",Scope Received,false,2026-08-30
+excluded,9999,Excluded Example,"999 Main Street, Sample City, KS 66999",Lost,true,2026-08-30

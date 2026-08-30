@@ -1,0 +1,14 @@
+{
+  "jnid": "job-beta",
+  "number": "9003",
+  "name": "Beta Homeowner",
+  "address_line1": "300 Main Street",
+  "address_line2": "",
+  "city": "Sample City",
+  "state_text": "KS",
+  "zip": "66103",
+  "date_updated": 1788100003,
+  "attachment_count": 1,
+  "status_name": "Scope Received",
+  "Claim #": "SYN-BETA"
+}

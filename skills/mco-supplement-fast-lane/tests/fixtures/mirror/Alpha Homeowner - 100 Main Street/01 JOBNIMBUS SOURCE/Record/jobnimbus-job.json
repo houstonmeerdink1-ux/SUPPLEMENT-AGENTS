@@ -1,0 +1,14 @@
+{
+  "jnid": "job-alpha-100",
+  "number": "9001",
+  "name": "Alpha Homeowner",
+  "address_line1": "100 Main Street",
+  "address_line2": "",
+  "city": "Sample City",
+  "state_text": "KS",
+  "zip": "66101",
+  "date_updated": 1788100001,
+  "attachment_count": 2,
+  "status_name": "Scope Received",
+  "Claim #": "SYN-ALPHA-100"
+}
