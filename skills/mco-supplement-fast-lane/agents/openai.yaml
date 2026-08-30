@@ -1,0 +1,3 @@
+interface:
+  display_name: "MCO Supplement Fast Lane"
+  short_description: "Resolve MCO job names into verified supplement work"
