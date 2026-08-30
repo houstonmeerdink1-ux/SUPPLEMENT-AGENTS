@@ -479,3 +479,130 @@ def prepare_job(
     _atomic_json_write(fingerprint_path, current_fingerprint)
     _atomic_json_write(run_state_path, run_state)
     return run_state
+
+
+def _live_metadata(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "date_updated": record.get("date_updated"),
+        "attachment_count": record.get("attachment_count"),
+        "status_name": record.get("status_name"),
+        "claim_number": record.get("Claim #"),
+        "insurance_company": record.get("Insurance Company"),
+    }
+
+
+def compare_live_job(
+    local_job: dict[str, Any],
+    live_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    job_id = str(local_job["job_id"])
+    records = [record for record in live_records if isinstance(record, dict)]
+    exact = [record for record in records if str(record.get("jnid") or "") == job_id]
+    if len(exact) > 1:
+        raise IdentityConflictError(f"Live JobNimbus returned job ID {job_id} more than once")
+    if not exact:
+        local_aliases = set(local_job.get("normalized_aliases") or [])
+        name_matches = [
+            record
+            for record in records
+            if normalize_name(str(record.get("name") or "")) in local_aliases
+        ]
+        if name_matches:
+            returned_ids = sorted(str(record.get("jnid") or "missing") for record in name_matches)
+            raise IdentityConflictError(
+                f"Live JobNimbus name matched but immutable job ID {job_id} did not; returned {returned_ids}"
+            )
+        raise JobNotFoundError(f"Live JobNimbus did not return locked job ID {job_id}")
+
+    live = exact[0]
+    live_number = str(live.get("number") or "").strip()
+    if live_number != str(local_job["job_number"]):
+        raise IdentityConflictError(
+            f"Live JobNimbus number conflicts for {job_id}: {live_number!r} != {local_job['job_number']!r}"
+        )
+    live_address, live_zip = _source_address(live)
+    if (
+        _normalize_street(live_address) != _normalize_street(str(local_job["exact_address"]))
+        or live_zip != str(local_job["zip"])
+    ):
+        raise IdentityConflictError(
+            f"Live JobNimbus address conflicts for {job_id}: {live_address!r} != {local_job['exact_address']!r}"
+        )
+
+    local_metadata = dict(local_job.get("captured_remote_metadata") or {})
+    live_metadata = _live_metadata(live)
+    field_order = (
+        "date_updated",
+        "attachment_count",
+        "status_name",
+        "claim_number",
+        "insurance_company",
+    )
+    changed_fields = [
+        field
+        for field in field_order
+        if local_metadata.get(field) != live_metadata.get(field)
+    ]
+    state = "SOURCE_CHANGED" if changed_fields else "DELTA_CHECKED"
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "job_id": job_id,
+        "job_number": local_job["job_number"],
+        "exact_address": local_job["exact_address"],
+        "state": state,
+        "changed_fields": changed_fields,
+        "local_metadata": local_metadata,
+        "live_metadata": live_metadata,
+        "snapshot_reusable": bool(local_job.get("fully_verified") and not changed_fields),
+        "attachment_completeness_proven": False,
+        "note": "Live aggregate metadata is a change signal; it is not attachment-completeness proof.",
+    }
+
+
+def record_live_delta(
+    job: dict[str, Any],
+    delta: dict[str, Any],
+    *,
+    now: str | None = None,
+) -> dict[str, Any]:
+    updated_at = now or _utc_now()
+    working = Path(str(job["folder_path"])) / JOB_WORKING / "00 FAST LANE"
+    state_path = working / "run-state.json"
+    run_state = _read_optional_json(state_path)
+    if not run_state:
+        raise StateTransitionError("Prepare the locked local job before recording a live delta")
+    if str(delta.get("job_id") or "") != str(job["job_id"]):
+        raise IdentityConflictError("Live delta job ID does not match the locked local job")
+
+    current = str(run_state.get("state") or "")
+    target = str(delta.get("state") or "")
+    if current == "SOURCE_INCOMPLETE":
+        target = current
+    elif target not in {"DELTA_CHECKED", "SOURCE_CHANGED"}:
+        raise StateTransitionError(f"Unsupported live delta state: {target!r}")
+
+    if current != target:
+        run_state.setdefault("history", []).append(
+            {
+                "from": current,
+                "to": target,
+                "reason": (
+                    "live JobNimbus metadata changed"
+                    if target == "SOURCE_CHANGED"
+                    else "exact live JobNimbus metadata matched"
+                ),
+                "at": updated_at,
+            }
+        )
+    run_state["state"] = target
+    run_state["updated_at"] = updated_at
+    run_state["last_live_delta"] = delta
+    blockers = list(run_state.get("blockers") or [])
+    live_change_prefix = "live JobNimbus metadata changed:"
+    blockers = [item for item in blockers if not str(item).startswith(live_change_prefix)]
+    if target == "SOURCE_CHANGED":
+        fields = ", ".join(delta.get("changed_fields") or [])
+        blockers.append(f"{live_change_prefix} {fields}")
+    run_state["blockers"] = blockers
+    _atomic_json_write(state_path, run_state)
+    return run_state
